@@ -1,0 +1,126 @@
+version: '3.8'
+
+services:
+  broker:
+    image: rabbitmq:3-management-alpine
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  db:
+    image: postgres:15-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=postgres
+    volumes:
+      - ./init-db.sh:/docker-entrypoint-initdb.d/init-db.sh
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  order-service:
+    build:
+      context: ./order-service
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - RABBITMQ_URL=amqp://guest:guest@broker:5672
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/order_db
+    depends_on:
+      broker:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  payment-service:
+    build:
+      context: ./payment-service
+    ports:
+      - "3001:3001"
+    environment:
+      - PORT=3001
+      - RABBITMQ_URL=amqp://guest:guest@broker:5672
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/payment_db
+    depends_on:
+      broker:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3001/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  inventory-service:
+    build:
+      context: ./inventory-service
+    ports:
+      - "3002:3002"
+    environment:
+      - PORT=3002
+      - RABBITMQ_URL=amqp://guest:guest@broker:5672
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/inventory_db
+    depends_on:
+      broker:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3002/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  shipping-service:
+    build:
+      context: ./shipping-service
+    ports:
+      - "3003:3003"
+    environment:
+      - PORT=3003
+      - RABBITMQ_URL=amqp://guest:guest@broker:5672
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/shipping_db
+    depends_on:
+      broker:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3003/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  notification-service:
+    build:
+      context: ./notification-service
+    ports:
+      - "3004:3004"
+    environment:
+      - PORT=3004
+      - RABBITMQ_URL=amqp://guest:guest@broker:5672
+    depends_on:
+      broker:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3004/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
