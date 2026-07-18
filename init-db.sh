@@ -19,6 +19,16 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "order_db" <<-EOSQL
         status VARCHAR(50) NOT NULL,
         created_at TIMESTAMP DEFAULT NOW()
     );
+    CREATE TABLE IF NOT EXISTS outbox (
+        id VARCHAR(50) PRIMARY KEY,
+        event_type VARCHAR(100) NOT NULL,
+        aggregate_id VARCHAR(50) NOT NULL,
+        payload JSONB NOT NULL,
+        routing_key VARCHAR(100) NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW(),
+        processed BOOLEAN DEFAULT FALSE,
+        processed_at TIMESTAMP
+    );
 EOSQL
 
 echo "Creating tables in payment_db..."
@@ -33,6 +43,16 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "payment_db" <<-EOS
         amount DECIMAL(10, 2) NOT NULL,
         status VARCHAR(50) NOT NULL,
         created_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS outbox (
+        id VARCHAR(50) PRIMARY KEY,
+        event_type VARCHAR(100) NOT NULL,
+        aggregate_id VARCHAR(50) NOT NULL,
+        payload JSONB NOT NULL,
+        routing_key VARCHAR(100) NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW(),
+        processed BOOLEAN DEFAULT FALSE,
+        processed_at TIMESTAMP
     );
 EOSQL
 
@@ -53,6 +73,16 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "inventory_db" <<-E
         quantity INTEGER NOT NULL,
         created_at TIMESTAMP DEFAULT NOW()
     );
+    CREATE TABLE IF NOT EXISTS outbox (
+        id VARCHAR(50) PRIMARY KEY,
+        event_type VARCHAR(100) NOT NULL,
+        aggregate_id VARCHAR(50) NOT NULL,
+        payload JSONB NOT NULL,
+        routing_key VARCHAR(100) NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW(),
+        processed BOOLEAN DEFAULT FALSE,
+        processed_at TIMESTAMP
+    );
     INSERT INTO inventory (product_id, stock) VALUES ('prod-123', 100) ON CONFLICT (product_id) DO NOTHING;
     INSERT INTO inventory (product_id, stock) VALUES ('FAIL-ME', 10) ON CONFLICT (product_id) DO NOTHING;
 EOSQL
@@ -69,6 +99,16 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "shipping_db" <<-EO
         tracking_number VARCHAR(100) NOT NULL,
         status VARCHAR(50) NOT NULL,
         created_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS outbox (
+        id VARCHAR(50) PRIMARY KEY,
+        event_type VARCHAR(100) NOT NULL,
+        aggregate_id VARCHAR(50) NOT NULL,
+        payload JSONB NOT NULL,
+        routing_key VARCHAR(100) NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW(),
+        processed BOOLEAN DEFAULT FALSE,
+        processed_at TIMESTAMP
     );
 EOSQL
 

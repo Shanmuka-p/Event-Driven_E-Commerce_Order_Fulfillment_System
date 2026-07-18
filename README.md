@@ -123,6 +123,20 @@ Wait until all services show `healthy` in `docker-compose ps`.
 
 ---
 
+## Postman Collection
+
+For a streamlined testing experience, we have included a pre-configured Postman Collection:
+- File: [Order_Fulfillment_System.postman_collection.json](file:///d:/Partnr/Main/week27/Event-Driven_E-Commerce_Order_Fulfillment_System/Order_Fulfillment_System.postman_collection.json)
+- **Features**:
+  - Automatically extracts and sets the global `orderId` variable upon placing a successful order, so you can call `Get Order Status` immediately without manual copy-pasting.
+  - Automatically extracts the global `failOrderId` variable upon placing a failing (`FAIL-ME`) order.
+  - Includes pre-configured Basic Authentication credentials for querying the RabbitMQ management API directly.
+- **How to use**:
+  1. Open Postman, click **Import**, and select the `Order_Fulfillment_System.postman_collection.json` file.
+  2. Start running the requests sequentially!
+
+---
+
 ## Verification and Testing
 
 ### 1. Normal E2E Checkout Flow

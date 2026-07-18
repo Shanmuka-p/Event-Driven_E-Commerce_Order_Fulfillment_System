@@ -1,0 +1,244 @@
+{
+	"info": {
+		"_postman_id": "a9f8e32c-7b3b-4171-8bda-fbde8c12a76f",
+		"name": "Event-Driven Order Fulfillment System",
+		"description": "Postman collection for testing and verifying the E-Commerce Order Fulfillment System microservices.",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+	},
+	"item": [
+		{
+			"name": "Create Order (Success Flow)",
+			"event": [
+				{
+					"listen": "test",
+					"script": {
+						"exec": [
+							"const response = pm.response.json();",
+							"if (response.orderId) {",
+							"    pm.globals.set(\"orderId\", response.orderId);",
+							"    console.log(\"Saved orderId to globals:\", response.orderId);",
+							"}"
+						],
+						"type": "text/javascript",
+						"packages": {}
+					}
+				}
+			],
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n  \"items\": [\n    {\n      \"productId\": \"prod-123\",\n      \"quantity\": 2,\n      \"price\": 10.50\n    }\n  ],\n  \"totalPrice\": 21.00\n}"
+				},
+				"url": {
+					"raw": "http://localhost:3000/api/orders",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "3000",
+					"path": [
+						"api",
+						"orders"
+					]
+				},
+				"description": "Creates a new order under PENDING status. This triggers the fulfillment pipeline. Automatically extracts the generated orderId into a global variable."
+			},
+			"response": []
+		},
+		{
+			"name": "Create Order (FAIL-ME for DLQ test)",
+			"event": [
+				{
+					"listen": "test",
+					"script": {
+						"exec": [
+							"const response = pm.response.json();",
+							"if (response.orderId) {",
+							"    pm.globals.set(\"failOrderId\", response.orderId);",
+							"    console.log(\"Saved failOrderId to globals:\", response.orderId);",
+							"}"
+						],
+						"type": "text/javascript",
+						"packages": {}
+					}
+				}
+			],
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n  \"items\": [\n    {\n      \"productId\": \"FAIL-ME\",\n      \"quantity\": 1,\n      \"price\": 10.00\n    }\n  ],\n  \"totalPrice\": 10.00\n}"
+				},
+				"url": {
+					"raw": "http://localhost:3000/api/orders",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "3000",
+					"path": [
+						"api",
+						"orders"
+					]
+				},
+				"description": "Places an order that contains a 'FAIL-ME' item. This triggers simulated failures in the Inventory Service, leading to retry cycles and eventual dead-lettering."
+			},
+			"response": []
+		},
+		{
+			"name": "Create Order (Price Tampered - Fails Validation)",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n  \"items\": [\n    {\n      \"productId\": \"prod-123\",\n      \"quantity\": 2,\n      \"price\": 10.50\n    }\n  ],\n  \"totalPrice\": 100.00\n}"
+				},
+				"url": {
+					"raw": "http://localhost:3000/api/orders",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "3000",
+					"path": [
+						"api",
+						"orders"
+					]
+				},
+				"description": "Tests validation constraints by sending an order with a tampered total price. Should return HTTP 400 Bad Request."
+			},
+			"response": []
+		},
+		{
+			"name": "Get Order Status",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "http://localhost:3000/api/orders/{{orderId}}",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "3000",
+					"path": [
+						"api",
+						"orders",
+						"{{orderId}}"
+					]
+				},
+				"description": "Queries the current status of the successfully placed order. Runs against the Order Database."
+			},
+			"response": []
+		},
+		{
+			"name": "Get Failing Order Status",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "http://localhost:3000/api/orders/{{failOrderId}}",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "3000",
+					"path": [
+						"api",
+						"orders",
+						"{{failOrderId}}"
+					]
+				},
+				"description": "Queries the current status of the failing order. Because of inventory failures, it should get stuck at 'PAID' status."
+			},
+			"response": []
+		},
+		{
+			"name": "Get RabbitMQ DLQ Message Count",
+			"request": {
+				"auth": {
+					"type": "basic",
+					"basic": [
+						{
+							"key": "password",
+							"value": "guest",
+							"type": "string"
+						},
+						{
+							"key": "username",
+							"value": "guest",
+							"type": "string"
+						}
+					]
+				},
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "http://localhost:15672/api/queues/%2F/dead_letter_queue",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "15672",
+					"path": [
+						"api",
+						"queues",
+						"%2F",
+						"dead_letter_queue"
+					]
+				},
+				"description": "Retrieves the dead letter queue info from the RabbitMQ management HTTP API to verify the dead-letter routing was triggered."
+			},
+			"response": []
+		},
+		{
+			"name": "Order Service Health Check",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "http://localhost:3000/health",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "3000",
+					"path": [
+						"health"
+					]
+				},
+				"description": "Checks the health status of the Order Service API."
+			},
+			"response": []
+		}
+	],
+	"variable": [
+		{
+			"key": "orderId",
+			"value": ""
+		},
+		{
+			"key": "failOrderId",
+			"value": ""
+		}
+	]
+}

@@ -1,7 +1,8 @@
 const express = require('express');
 const { Pool } = require('pg');
-const amqp = require('amqplib');
 const { v4: uuidv4 } = require('uuid');
+const ResilientRabbitMQ = require('./rabbitmq');
+const OutboxWorker = require('./outbox');
 
 const PORT = process.env.PORT || 3001;
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -10,16 +11,12 @@ const RABBITMQ_URL = process.env.RABBITMQ_URL;
 const app = express();
 app.use(express.json());
 
-let dbPool;
-let mqConnection;
-let mqChannel;
-
+const dbPool = new Pool({ connectionString: DATABASE_URL });
 const EXCHANGE_NAME = 'ecommerce_events';
 const QUEUE_NAME = 'payment_queue';
 
 // Connect to Database with retries
 async function connectDb() {
-  dbPool = new Pool({ connectionString: DATABASE_URL });
   for (let i = 0; i < 15; i++) {
     try {
       await dbPool.query('SELECT 1');
@@ -33,32 +30,16 @@ async function connectDb() {
   throw new Error('Could not connect to PostgreSQL');
 }
 
-// Connect to RabbitMQ with retries
-async function connectMq() {
-  for (let i = 0; i < 15; i++) {
-    try {
-      mqConnection = await amqp.connect(RABBITMQ_URL);
-      mqChannel = await mqConnection.createChannel();
-      console.log('Successfully connected to RabbitMQ');
-      return;
-    } catch (err) {
-      console.log(`RabbitMQ connection failed, retrying in 2 seconds (${i + 1}/15)...`);
-      await new Promise(resolve => setTimeout(resolve, 2000));
-    }
-  }
-  throw new Error('Could not connect to RabbitMQ');
-}
+const rabbitmq = new ResilientRabbitMQ(RABBITMQ_URL);
+const outboxWorker = new OutboxWorker(dbPool, rabbitmq, EXCHANGE_NAME, 500);
 
-// Setup RabbitMQ Topology
-async function setupMq() {
-  await mqChannel.assertExchange(EXCHANGE_NAME, 'topic', { durable: true });
-  await mqChannel.assertQueue(QUEUE_NAME, { durable: true });
-  await mqChannel.bindQueue(QUEUE_NAME, EXCHANGE_NAME, 'order.created');
+rabbitmq.onConnect = async (channel) => {
+  await channel.assertExchange(EXCHANGE_NAME, 'topic', { durable: true });
+  await channel.assertQueue(QUEUE_NAME, { durable: true });
+};
 
-  // Consume OrderCreated events
-  mqChannel.consume(QUEUE_NAME, async (msg) => {
-    if (!msg) return;
-
+async function setupSubscriptions() {
+  await rabbitmq.subscribe(QUEUE_NAME, ['order.created'], { noAck: false }, async (msg, channel) => {
     const client = await dbPool.connect();
     try {
       const event = JSON.parse(msg.content.toString());
@@ -67,18 +48,18 @@ async function setupMq() {
       await client.query('BEGIN');
 
       // 1. Check Idempotency
-      const check = await client.query('SELECT 1 FROM processed_events WHERE event_id = $1', [event.eventId]);
+      const check = await client.query('SELECT 1 FROM processed_events WHERE event_id = $1 FOR UPDATE', [event.eventId]);
       if (check.rowCount > 0) {
         console.log(`Event ${event.eventId} already processed. Skipping business logic.`);
         await client.query('ROLLBACK');
-        mqChannel.ack(msg);
+        channel.ack(msg);
         return;
       }
 
       // 2. Execute Business Logic (Simulated Payment)
       const paymentId = uuidv4();
       const amount = event.payload.totalPrice;
-      const status = amount > 0 ? 'SUCCESS' : 'FAILED'; // simulate success for positive amount
+      const status = amount > 0 ? 'SUCCESS' : 'FAILED';
 
       await client.query(
         'INSERT INTO payments (id, order_id, amount, status) VALUES ($1, $2, $3, $4)',
@@ -88,38 +69,38 @@ async function setupMq() {
       // 3. Mark Event as Processed (in the same transaction)
       await client.query('INSERT INTO processed_events (event_id) VALUES ($1)', [event.eventId]);
 
-      await client.query('COMMIT');
-
-      // 4. Publish next event (PaymentProcessed)
+      // 4. Save PaymentProcessed to Outbox if payment is successful
       if (status === 'SUCCESS') {
-        const nextEvent = {
-          eventId: uuidv4(),
-          eventType: 'PaymentProcessed',
-          timestamp: new Date().toISOString(),
-          aggregateId: event.aggregateId, // orderId
-          payload: {
-            paymentId,
-            amount,
-            status,
-            items: event.payload.items // pass items downstream for Inventory Service
-          }
+        const nextEventId = uuidv4();
+        const nextEventPayload = {
+          paymentId,
+          amount,
+          status,
+          items: event.payload.items
         };
 
-        mqChannel.publish(EXCHANGE_NAME, 'payment.processed', Buffer.from(JSON.stringify(nextEvent)), {
-          persistent: true
-        });
-        console.log(`Published PaymentProcessed event for Order ID: ${event.aggregateId}`);
+        await client.query(
+          'INSERT INTO outbox (id, event_type, aggregate_id, payload, routing_key) VALUES ($1, $2, $3, $4, $5)',
+          [
+            nextEventId,
+            'PaymentProcessed',
+            event.aggregateId,
+            JSON.stringify(nextEventPayload),
+            'payment.processed'
+          ]
+        );
+        console.log(`Saved PaymentProcessed event for Order: ${event.aggregateId} to outbox.`);
       } else {
-        console.log(`Payment failed for Order ID: ${event.aggregateId}. PaymentProcessed event not published.`);
+        console.log(`Payment failed for Order ID: ${event.aggregateId}. Outbox entry not created.`);
       }
 
-      // 5. Acknowledge message
-      mqChannel.ack(msg);
+      await client.query('COMMIT');
+      channel.ack(msg);
     } catch (err) {
-      console.error('Error processing OrderCreated event, rolling back:', err);
+      console.error('Error processing OrderCreated event, rolling back:', err.message);
       await client.query('ROLLBACK');
-      // Do not ack. Requeue so it can retry
-      mqChannel.nack(msg, false, true);
+      // Requeue for retry
+      channel.nack(msg, false, true);
     } finally {
       client.release();
     }
@@ -133,12 +114,45 @@ app.get('/health', (req, res) => {
 
 async function start() {
   await connectDb();
-  await connectMq();
-  await setupMq();
 
-  app.listen(PORT, () => {
+  rabbitmq.on('connected', () => {
+    console.log('RabbitMQ connection established, starting Outbox worker...');
+    outboxWorker.start();
+  });
+
+  rabbitmq.on('disconnected', () => {
+    console.log('RabbitMQ disconnected, stopping Outbox worker...');
+    outboxWorker.stop();
+  });
+
+  await rabbitmq.connect();
+  await setupSubscriptions();
+
+  const server = app.listen(PORT, () => {
     console.log(`Payment Service is listening on port ${PORT}`);
   });
+
+  // Graceful Shutdown Handler
+  const shutdown = async (signal) => {
+    console.log(`Received ${signal}. Starting graceful shutdown...`);
+    server.close(() => {
+      console.log('HTTP server closed.');
+    });
+
+    outboxWorker.stop();
+    await rabbitmq.close();
+
+    if (dbPool) {
+      await dbPool.end();
+      console.log('PostgreSQL connection pool closed.');
+    }
+
+    console.log('Graceful shutdown completed successfully. Exiting.');
+    process.exit(0);
+  };
+
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
 }
 
 start().catch(err => {

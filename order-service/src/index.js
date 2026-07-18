@@ -1,7 +1,8 @@
 const express = require('express');
 const { Pool } = require('pg');
-const amqp = require('amqplib');
 const { v4: uuidv4 } = require('uuid');
+const ResilientRabbitMQ = require('./rabbitmq');
+const OutboxWorker = require('./outbox');
 
 const PORT = process.env.PORT || 3000;
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -10,10 +11,7 @@ const RABBITMQ_URL = process.env.RABBITMQ_URL;
 const app = express();
 app.use(express.json());
 
-let dbPool;
-let mqConnection;
-let mqChannel;
-
+const dbPool = new Pool({ connectionString: DATABASE_URL });
 const EXCHANGE_NAME = 'ecommerce_events';
 const QUEUE_NAME = 'order_status_queue';
 
@@ -26,7 +24,6 @@ const statusRank = {
 
 // Connect to Database with retries
 async function connectDb() {
-  dbPool = new Pool({ connectionString: DATABASE_URL });
   for (let i = 0; i < 15; i++) {
     try {
       await dbPool.query('SELECT 1');
@@ -40,37 +37,18 @@ async function connectDb() {
   throw new Error('Could not connect to PostgreSQL');
 }
 
-// Connect to RabbitMQ with retries
-async function connectMq() {
-  for (let i = 0; i < 15; i++) {
-    try {
-      mqConnection = await amqp.connect(RABBITMQ_URL);
-      mqChannel = await mqConnection.createChannel();
-      console.log('Successfully connected to RabbitMQ');
-      return;
-    } catch (err) {
-      console.log(`RabbitMQ connection failed, retrying in 2 seconds (${i + 1}/15)...`);
-      await new Promise(resolve => setTimeout(resolve, 2000));
-    }
-  }
-  throw new Error('Could not connect to RabbitMQ');
-}
+const rabbitmq = new ResilientRabbitMQ(RABBITMQ_URL);
+const outboxWorker = new OutboxWorker(dbPool, rabbitmq, EXCHANGE_NAME, 500);
 
-// Setup RabbitMQ Topology
-async function setupMq() {
-  await mqChannel.assertExchange(EXCHANGE_NAME, 'topic', { durable: true });
-  await mqChannel.assertQueue(QUEUE_NAME, { durable: true });
+rabbitmq.onConnect = async (channel) => {
+  await channel.assertExchange(EXCHANGE_NAME, 'topic', { durable: true });
+  await channel.assertQueue(QUEUE_NAME, { durable: true });
+};
 
-  // Bind status updates queue
+async function setupSubscriptions() {
   const statusBindings = ['payment.processed', 'inventory.reserved', 'shipment.created'];
-  for (const binding of statusBindings) {
-    await mqChannel.bindQueue(QUEUE_NAME, EXCHANGE_NAME, binding);
-  }
-
-  // Consume status updates
-  mqChannel.consume(QUEUE_NAME, async (msg) => {
-    if (!msg) return;
-
+  
+  await rabbitmq.subscribe(QUEUE_NAME, statusBindings, { noAck: false }, async (msg, channel) => {
     try {
       const event = JSON.parse(msg.content.toString());
       console.log(`Received status update event: ${event.eventType} for Order ID: ${event.aggregateId}`);
@@ -85,7 +63,6 @@ async function setupMq() {
       }
 
       if (nextStatus) {
-        // Idempotent/ordered status update
         const client = await dbPool.connect();
         try {
           await client.query('BEGIN');
@@ -113,11 +90,11 @@ async function setupMq() {
         }
       }
 
-      mqChannel.ack(msg);
+      channel.ack(msg);
     } catch (err) {
-      console.error('Error processing status update event:', err);
-      // Nack and requeue status updates for transient errors
-      mqChannel.nack(msg, false, true);
+      console.error('Error processing status update event:', err.message);
+      // Requeue status update for retry
+      channel.nack(msg, false, true);
     }
   });
 }
@@ -126,46 +103,70 @@ async function setupMq() {
 app.post('/api/orders', async (req, res) => {
   const { items, totalPrice } = req.body;
 
+  // Strict Request Validation
   if (!items || !Array.isArray(items) || items.length === 0) {
-    return res.status(400).json({ error: 'Items must be a non-empty array' });
+    return res.status(400).json({ error: 'items must be a non-empty array' });
   }
-  if (totalPrice === undefined || typeof totalPrice !== 'number') {
-    return res.status(400).json({ error: 'totalPrice must be a number' });
+  if (totalPrice === undefined || typeof totalPrice !== 'number' || totalPrice <= 0) {
+    return res.status(400).json({ error: 'totalPrice must be a positive number' });
+  }
+
+  let calculatedTotal = 0;
+  for (const item of items) {
+    if (!item.productId || typeof item.productId !== 'string' || item.productId.trim() === '') {
+      return res.status(400).json({ error: 'Each item must have a valid productId' });
+    }
+    if (!item.quantity || !Number.isInteger(item.quantity) || item.quantity <= 0) {
+      return res.status(400).json({ error: 'Each item must have a positive integer quantity' });
+    }
+    if (item.price === undefined || typeof item.price !== 'number' || item.price <= 0) {
+      return res.status(400).json({ error: 'Each item must have a positive price' });
+    }
+    calculatedTotal += item.quantity * item.price;
+  }
+
+  // Prevent price tempering
+  if (Math.abs(calculatedTotal - totalPrice) > 0.01) {
+    return res.status(400).json({ 
+      error: `totalPrice (${totalPrice}) does not match the sum of item totals (${calculatedTotal.toFixed(2)})` 
+    });
   }
 
   const orderId = uuidv4();
 
+  const client = await dbPool.connect();
   try {
+    await client.query('BEGIN');
+
     // 1. Save order to local database
-    await dbPool.query(
+    await client.query(
       'INSERT INTO orders (id, items, total_price, status) VALUES ($1, $2, $3, $4)',
       [orderId, JSON.stringify(items), totalPrice, 'PENDING']
     );
 
-    // 2. Build standardized event
-    const event = {
-      eventId: uuidv4(),
-      eventType: 'OrderCreated',
-      timestamp: new Date().toISOString(),
-      aggregateId: orderId,
-      payload: {
-        items,
-        totalPrice
-      }
+    // 2. Insert event to Outbox table within the same transaction
+    const eventId = uuidv4();
+    const eventPayload = {
+      items,
+      totalPrice
     };
 
-    // 3. Publish OrderCreated
-    mqChannel.publish(EXCHANGE_NAME, 'order.created', Buffer.from(JSON.stringify(event)), {
-      persistent: true
-    });
+    await client.query(
+      'INSERT INTO outbox (id, event_type, aggregate_id, payload, routing_key) VALUES ($1, $2, $3, $4, $5)',
+      [eventId, 'OrderCreated', orderId, JSON.stringify(eventPayload), 'order.created']
+    );
 
-    console.log(`Published OrderCreated event for Order ID: ${orderId}`);
-
-    // 4. Return 202 Accepted
+    await client.query('COMMIT');
+    console.log(`Transaction committed for Order ID: ${orderId}. Saved to Outbox.`);
+    
+    // Return 202 Accepted immediately
     return res.status(202).json({ orderId });
   } catch (err) {
     console.error('Failed to create order:', err);
+    await client.query('ROLLBACK');
     return res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    client.release();
   }
 });
 
@@ -200,12 +201,45 @@ app.get('/health', (req, res) => {
 
 async function start() {
   await connectDb();
-  await connectMq();
-  await setupMq();
+  
+  rabbitmq.on('connected', () => {
+    console.log('RabbitMQ connection established, starting Outbox worker...');
+    outboxWorker.start();
+  });
+  
+  rabbitmq.on('disconnected', () => {
+    console.log('RabbitMQ disconnected, stopping Outbox worker...');
+    outboxWorker.stop();
+  });
 
-  app.listen(PORT, () => {
+  await rabbitmq.connect();
+  await setupSubscriptions();
+
+  const server = app.listen(PORT, () => {
     console.log(`Order Service is listening on port ${PORT}`);
   });
+
+  // Graceful Shutdown Handler
+  const shutdown = async (signal) => {
+    console.log(`Received ${signal}. Starting graceful shutdown...`);
+    server.close(() => {
+      console.log('HTTP server closed.');
+    });
+    
+    outboxWorker.stop();
+    await rabbitmq.close();
+    
+    if (dbPool) {
+      await dbPool.end();
+      console.log('PostgreSQL connection pool closed.');
+    }
+    
+    console.log('Graceful shutdown completed successfully. Exiting.');
+    process.exit(0);
+  };
+
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
 }
 
 start().catch(err => {

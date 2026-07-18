@@ -1,7 +1,8 @@
 const express = require('express');
 const { Pool } = require('pg');
-const amqp = require('amqplib');
 const { v4: uuidv4 } = require('uuid');
+const ResilientRabbitMQ = require('./rabbitmq');
+const OutboxWorker = require('./outbox');
 
 const PORT = process.env.PORT || 3002;
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -10,10 +11,7 @@ const RABBITMQ_URL = process.env.RABBITMQ_URL;
 const app = express();
 app.use(express.json());
 
-let dbPool;
-let mqConnection;
-let mqChannel;
-
+const dbPool = new Pool({ connectionString: DATABASE_URL });
 const EXCHANGE_NAME = 'ecommerce_events';
 const QUEUE_NAME = 'inventory_queue';
 const DLX_EXCHANGE = 'dlx_exchange';
@@ -24,7 +22,6 @@ const retryCounts = new Map();
 
 // Connect to Database with retries
 async function connectDb() {
-  dbPool = new Pool({ connectionString: DATABASE_URL });
   for (let i = 0; i < 15; i++) {
     try {
       await dbPool.query('SELECT 1');
@@ -38,47 +35,30 @@ async function connectDb() {
   throw new Error('Could not connect to PostgreSQL');
 }
 
-// Connect to RabbitMQ with retries
-async function connectMq() {
-  for (let i = 0; i < 15; i++) {
-    try {
-      mqConnection = await amqp.connect(RABBITMQ_URL);
-      mqChannel = await mqConnection.createChannel();
-      console.log('Successfully connected to RabbitMQ');
-      return;
-    } catch (err) {
-      console.log(`RabbitMQ connection failed, retrying in 2 seconds (${i + 1}/15)...`);
-      await new Promise(resolve => setTimeout(resolve, 2000));
-    }
-  }
-  throw new Error('Could not connect to RabbitMQ');
-}
+const rabbitmq = new ResilientRabbitMQ(RABBITMQ_URL);
+const outboxWorker = new OutboxWorker(dbPool, rabbitmq, EXCHANGE_NAME, 500);
 
-// Setup RabbitMQ Topology
-async function setupMq() {
-  // Main Exchange
-  await mqChannel.assertExchange(EXCHANGE_NAME, 'topic', { durable: true });
+rabbitmq.onConnect = async (channel) => {
+  // Assert exchanges
+  await channel.assertExchange(EXCHANGE_NAME, 'topic', { durable: true });
+  await channel.assertExchange(DLX_EXCHANGE, 'topic', { durable: true });
+  
+  // Assert dead letter queue and bind it
+  await channel.assertQueue(DLQ_NAME, { durable: true });
+  await channel.bindQueue(DLQ_NAME, DLX_EXCHANGE, 'inventory.failed');
 
-  // Dead Letter Exchange and Queue
-  await mqChannel.assertExchange(DLX_EXCHANGE, 'topic', { durable: true });
-  await mqChannel.assertQueue(DLQ_NAME, { durable: true });
-  await mqChannel.bindQueue(DLQ_NAME, DLX_EXCHANGE, 'inventory.failed');
-
-  // Main Queue with DLQ arguments
-  await mqChannel.assertQueue(QUEUE_NAME, {
+  // Assert main queue with dead letter exchange settings
+  await channel.assertQueue(QUEUE_NAME, {
     durable: true,
     arguments: {
       'x-dead-letter-exchange': DLX_EXCHANGE,
       'x-dead-letter-routing-key': 'inventory.failed'
     }
   });
+};
 
-  await mqChannel.bindQueue(QUEUE_NAME, EXCHANGE_NAME, 'payment.processed');
-
-  // Consume PaymentProcessed events
-  mqChannel.consume(QUEUE_NAME, async (msg) => {
-    if (!msg) return;
-
+async function setupSubscriptions() {
+  await rabbitmq.subscribe(QUEUE_NAME, ['payment.processed'], { noAck: false }, async (msg, channel) => {
     const event = JSON.parse(msg.content.toString());
     console.log(`Received PaymentProcessed event: ${event.eventId} for Order ID: ${event.aggregateId}`);
 
@@ -92,13 +72,13 @@ async function setupMq() {
         retryCounts.set(event.eventId, attempt);
         console.warn(`Simulating processing failure (attempt ${attempt}/3) for Order ID: ${event.aggregateId}. Requeueing...`);
         // Requeue: true to retry
-        mqChannel.nack(msg, false, true);
+        channel.nack(msg, false, true);
         return;
       } else {
         retryCounts.delete(event.eventId);
         console.error(`Simulating processing failure (attempt ${attempt}/3) for Order ID: ${event.aggregateId}. Routing to DLQ...`);
-        // Requeue: false to route to DLQ
-        mqChannel.nack(msg, false, false);
+        // Requeue: false to route to DLQ (causes dead-lettering by RabbitMQ)
+        channel.nack(msg, false, false);
         return;
       }
     }
@@ -108,11 +88,11 @@ async function setupMq() {
       await client.query('BEGIN');
 
       // 1. Check Idempotency
-      const check = await client.query('SELECT 1 FROM processed_events WHERE event_id = $1', [event.eventId]);
+      const check = await client.query('SELECT 1 FROM processed_events WHERE event_id = $1 FOR UPDATE', [event.eventId]);
       if (check.rowCount > 0) {
         console.log(`Event ${event.eventId} already processed. Skipping business logic.`);
         await client.query('ROLLBACK');
-        mqChannel.ack(msg);
+        channel.ack(msg);
         return;
       }
 
@@ -124,7 +104,6 @@ async function setupMq() {
         );
 
         if (updateRes.rowCount === 0) {
-          // Log a warning if stock is low, but create reservation anyway for fulfillment simulation
           console.warn(`Insufficient stock for product ${item.productId}, fulfilling anyway...`);
         }
 
@@ -138,30 +117,30 @@ async function setupMq() {
       // 3. Mark Event as Processed (in the same transaction)
       await client.query('INSERT INTO processed_events (event_id) VALUES ($1)', [event.eventId]);
 
-      await client.query('COMMIT');
-
-      // 4. Publish next event (InventoryReserved)
-      const nextEvent = {
-        eventId: uuidv4(),
-        eventType: 'InventoryReserved',
-        timestamp: new Date().toISOString(),
-        aggregateId: event.aggregateId, // orderId
-        payload: {
-          items
-        }
+      // 4. Save InventoryReserved to Outbox in same transaction
+      const nextEventId = uuidv4();
+      const nextEventPayload = {
+        items
       };
 
-      mqChannel.publish(EXCHANGE_NAME, 'inventory.reserved', Buffer.from(JSON.stringify(nextEvent)), {
-        persistent: true
-      });
-      console.log(`Published InventoryReserved event for Order ID: ${event.aggregateId}`);
+      await client.query(
+        'INSERT INTO outbox (id, event_type, aggregate_id, payload, routing_key) VALUES ($1, $2, $3, $4, $5)',
+        [
+          nextEventId,
+          'InventoryReserved',
+          event.aggregateId,
+          JSON.stringify(nextEventPayload),
+          'inventory.reserved'
+        ]
+      );
+      console.log(`Saved InventoryReserved event for Order: ${event.aggregateId} to outbox.`);
 
-      // 5. Acknowledge message
-      mqChannel.ack(msg);
+      await client.query('COMMIT');
+      channel.ack(msg);
     } catch (err) {
-      console.error('Error processing PaymentProcessed event, rolling back:', err);
+      console.error('Error processing PaymentProcessed event, rolling back:', err.message);
       await client.query('ROLLBACK');
-      mqChannel.nack(msg, false, true);
+      channel.nack(msg, false, true);
     } finally {
       client.release();
     }
@@ -175,12 +154,45 @@ app.get('/health', (req, res) => {
 
 async function start() {
   await connectDb();
-  await connectMq();
-  await setupMq();
 
-  app.listen(PORT, () => {
+  rabbitmq.on('connected', () => {
+    console.log('RabbitMQ connection established, starting Outbox worker...');
+    outboxWorker.start();
+  });
+
+  rabbitmq.on('disconnected', () => {
+    console.log('RabbitMQ disconnected, stopping Outbox worker...');
+    outboxWorker.stop();
+  });
+
+  await rabbitmq.connect();
+  await setupSubscriptions();
+
+  const server = app.listen(PORT, () => {
     console.log(`Inventory Service is listening on port ${PORT}`);
   });
+
+  // Graceful Shutdown Handler
+  const shutdown = async (signal) => {
+    console.log(`Received ${signal}. Starting graceful shutdown...`);
+    server.close(() => {
+      console.log('HTTP server closed.');
+    });
+
+    outboxWorker.stop();
+    await rabbitmq.close();
+
+    if (dbPool) {
+      await dbPool.end();
+      console.log('PostgreSQL connection pool closed.');
+    }
+
+    console.log('Graceful shutdown completed successfully. Exiting.');
+    process.exit(0);
+  };
+
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
 }
 
 start().catch(err => {

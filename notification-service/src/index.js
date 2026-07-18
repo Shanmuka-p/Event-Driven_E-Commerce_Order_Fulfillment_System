@@ -1,5 +1,5 @@
 const express = require('express');
-const amqp = require('amqplib');
+const ResilientRabbitMQ = require('./rabbitmq');
 
 const PORT = process.env.PORT || 3004;
 const RABBITMQ_URL = process.env.RABBITMQ_URL;
@@ -7,50 +7,28 @@ const RABBITMQ_URL = process.env.RABBITMQ_URL;
 const app = express();
 app.use(express.json());
 
-let mqConnection;
-let mqChannel;
-
 const EXCHANGE_NAME = 'ecommerce_events';
 const QUEUE_NAME = 'notification_queue';
 
-// Connect to RabbitMQ with retries
-async function connectMq() {
-  for (let i = 0; i < 15; i++) {
-    try {
-      mqConnection = await amqp.connect(RABBITMQ_URL);
-      mqChannel = await mqConnection.createChannel();
-      console.log('Successfully connected to RabbitMQ');
-      return;
-    } catch (err) {
-      console.log(`RabbitMQ connection failed, retrying in 2 seconds (${i + 1}/15)...`);
-      await new Promise(resolve => setTimeout(resolve, 2000));
-    }
-  }
-  throw new Error('Could not connect to RabbitMQ');
-}
+const rabbitmq = new ResilientRabbitMQ(RABBITMQ_URL);
 
-// Setup RabbitMQ Topology
-async function setupMq() {
-  await mqChannel.assertExchange(EXCHANGE_NAME, 'topic', { durable: true });
-  await mqChannel.assertQueue(QUEUE_NAME, { durable: true });
+rabbitmq.onConnect = async (channel) => {
+  await channel.assertExchange(EXCHANGE_NAME, 'topic', { durable: true });
+  await channel.assertQueue(QUEUE_NAME, { durable: true });
+};
 
+async function setupSubscriptions() {
   const bindings = ['order.created', 'payment.processed', 'inventory.reserved', 'shipment.created'];
-  for (const binding of bindings) {
-    await mqChannel.bindQueue(QUEUE_NAME, EXCHANGE_NAME, binding);
-  }
-
-  // Consume events
-  mqChannel.consume(QUEUE_NAME, (msg) => {
-    if (!msg) return;
-
+  
+  await rabbitmq.subscribe(QUEUE_NAME, bindings, { noAck: false }, async (msg, channel) => {
     try {
       const event = JSON.parse(msg.content.toString());
       console.log(`Notification sent for event: ${event.eventType}, Order ID: ${event.aggregateId}`);
-      mqChannel.ack(msg);
+      channel.ack(msg);
     } catch (err) {
-      console.error('Error processing notification event:', err);
-      // Nack and requeue notifications
-      mqChannel.nack(msg, false, true);
+      console.error('Error processing notification event:', err.message);
+      // Requeue notification event for retry
+      channel.nack(msg, false, true);
     }
   });
 }
@@ -61,12 +39,31 @@ app.get('/health', (req, res) => {
 });
 
 async function start() {
-  await connectMq();
-  await setupMq();
+  rabbitmq.on('connected', () => {
+    console.log('RabbitMQ connection established for Notification Service');
+  });
 
-  app.listen(PORT, () => {
+  await rabbitmq.connect();
+  await setupSubscriptions();
+
+  const server = app.listen(PORT, () => {
     console.log(`Notification Service is listening on port ${PORT}`);
   });
+
+  // Graceful Shutdown Handler
+  const shutdown = async (signal) => {
+    console.log(`Received ${signal}. Starting graceful shutdown...`);
+    server.close(() => {
+      console.log('HTTP server closed.');
+    });
+
+    await rabbitmq.close();
+    console.log('Graceful shutdown completed successfully. Exiting.');
+    process.exit(0);
+  };
+
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
 }
 
 start().catch(err => {
